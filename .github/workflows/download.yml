@@ -1,5 +1,4 @@
-cat > .github/workflows/download.yml << 'EOF'
-name: دانلود خودکار فایل
+name: SalviaFeri Downloader
 
 on:
   workflow_dispatch:
@@ -182,4 +181,3 @@ jobs:
           git commit -m "✨ افزودن فایل‌های دانلود شده - $(date '+%Y-%m-%d %H:%M:%S')" || echo "ℹ️ تغییر جدیدی وجود ندارد"
           git push
           echo "✅ تغییرات با موفقیت به گیت‌هاب ارسال شد"
-EOF
