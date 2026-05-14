@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: 'لینک‌های دانلود (برای چند لینک با فاصله جدا کنید)'
+        description: '🔗 لینک‌های دانلود (چند لینک با فاصله)'
         required: true
         type: string
       password:
-        description: 'رمز فایل ZIP (اختیاری)'
+        description: '🔒 رمز ZIP (اختیاری)'
         required: false
         type: string
 
@@ -16,168 +16,263 @@ jobs:
   download:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    steps:
-      - name: دریافت کدهای ریپازیتوری
-        uses: actions/checkout@v4
+    permissions:
+      contents: write
 
-      - name: نصب ابزارهای مورد نیاز
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: راه‌اندازی WARP (برای دور زدن تحریم)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2 zip unzip p7zip-full ffmpeg curl
+          docker network create warp-net 2>/dev/null || true
+          docker run -d --name warp --restart=always --network warp-net \
+            -p 1080:1080 --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+          echo "⏳ Waiting for WARP..."
+          sleep 15
+          for i in 1 2 3 4 5; do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 \
+              https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "✅ WARP active"; break
+            else
+              echo "Attempt $i/5..."; sleep 5
+            fi
+          done
+
+      - name: نصب ابزارها
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y aria2 zip unzip p7zip-full ffmpeg curl jq
           pip install yt-dlp --quiet
 
-      - name: ساخت پوشه Downloads
+      - name: راه‌اندازی گیت و پوشه‌ها
         run: |
+          git config user.name "SalviaFeri[bot]"
+          git config user.email "salviaferi@local"
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard origin/"${GITHUB_REF_NAME}"
           mkdir -p Downloads
-          echo "✅ پوشه Downloads آماده شد"
 
-      - name: پردازش لینک‌ها
+      - name: پردازش و دانلود
+        env:
+          INPUT_URLS: ${{ github.event.inputs.urls }}
+          INPUT_PASSWORD: ${{ github.event.inputs.password }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          urls="${{ github.event.inputs.urls }}"
-          password="${{ github.event.inputs.password }}"
+          urls_raw="${INPUT_URLS}"
+          password="${INPUT_PASSWORD}"
+          
+          # تبدیل رشته به آرایه
+          read -ra url_array <<< "$urls_raw"
+          
           index=1
           total_success=0
+          max_file_size=1073741824  # 1GB
+          split_size_mb=90
+          split_threshold=$((100 * 1024 * 1024))  # 100MB
           
-          for url in $urls; do
+          for url in "${url_array[@]}"; do
             echo ""
-            echo "═══════════════════════════════════════════════════════════"
-            echo "📥 پردازش لینک شماره $index : $url"
-            echo "═══════════════════════════════════════════════════════════"
+            echo "════════════════════════════════════════════"
+            echo "📥 #${index}: ${url}"
+            echo "════════════════════════════════════════════"
             
-            # مرحله 1: تشخیص نوع لینک و دانلود
-            if echo "$url" | grep -qE "(youtube\.com|youtu\.be|aparat\.com|instagram\.com)"; then
-              echo "🎬 تشخیص داده شد: سایت ویدیویی"
-              yt-dlp -f "best[ext=mp4]" "$url" -o "temp_$index.mp4" --no-progress
-              filename="temp_$index.mp4"
-            else
-              echo "🔗 تشخیص داده شد: لینک مستقیم"
+            # تشخیص نوع لینک
+            is_stream=false
+            if echo "$url" | grep -qiE "(youtube\.com|youtu\.be|aparat\.com|instagram\.com|tiktok\.com|twitter\.com|x\.com|vimeo\.com)"; then
+              is_stream=true
+            fi
+            
+            if $is_stream; then
+              echo "🎬 تشخیص: سایت استریم"
               
-              # بررسی حجم فایل قبل از دانلود
-              filesize=$(curl -sI "$url" | grep -i "content-length" | awk '{print $2}' | tr -d '\r')
-              if [ -n "$filesize" ] && [ "$filesize" -gt 1073741824 ]; then
-                echo "❌ خطا: حجم فایل $(echo "scale=2; $filesize/1073741824" | bc) گیگابایت است و از حد مجاز 1 گیگابایت بیشتر است"
-                index=$((index+1))
-                continue
+              # تلاش با روش‌های مختلف yt-dlp
+              downloaded=false
+              for method in 1 2 3 4 5 6; do
+                [ "$downloaded" = true ] && break
+                echo "  روش ${method}..."
+                
+                case $method in
+                  1) yt-dlp --proxy "socks5://127.0.0.1:1080" \
+                     -f "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best" \
+                     --merge-output-format mp4 -o "temp_${index}.%(ext)s" \
+                     --no-playlist --no-check-certificates \
+                     --extractor-args "youtube:player_client=web" \
+                     "$url" 2>&1 | tail -3 && downloaded=true ;;
+                  2) yt-dlp --proxy "socks5://127.0.0.1:1080" \
+                     -f "best[height<=720]" --merge-output-format mp4 \
+                     -o "temp_${index}.%(ext)s" --no-playlist \
+                     --extractor-args "youtube:player_client=mweb" \
+                     "$url" 2>&1 | tail -3 && downloaded=true ;;
+                  3) yt-dlp --proxy "socks5://127.0.0.1:1080" \
+                     -f "best" -o "temp_${index}.%(ext)s" \
+                     --no-playlist --extractor-args "youtube:player_client=android" \
+                     "$url" 2>&1 | tail -3 && downloaded=true ;;
+                  4) yt-dlp -f "best[height<=720]" --merge-output-format mp4 \
+                     -o "temp_${index}.%(ext)s" --no-playlist \
+                     "$url" 2>&1 | tail -3 && downloaded=true ;;
+                  5) yt-dlp -f "best" -o "temp_${index}.%(ext)s" \
+                     --no-playlist "$url" 2>&1 | tail -3 && downloaded=true ;;
+                  6) aria2c -x 16 -s 16 --console-log-level=error \
+                     "$url" -o "temp_${index}" 2>&1 && downloaded=true ;;
+                esac
+              done
+              
+              # پیدا کردن فایل دانلود شده
+              filename=$(ls "temp_${index}".* 2>/dev/null | head -1)
+              [ -z "$filename" ] && filename="temp_${index}"
+              
+            else
+              echo "📄 تشخیص: لینک مستقیم"
+              
+              # بررسی حجم
+              filesize=$(curl -sI --max-time 15 "$url" 2>/dev/null | \
+                grep -i "content-length" | tail -1 | awk '{print $2}' | tr -d '\r')
+              if [ -n "$filesize" ] && [ "$filesize" -gt "$max_file_size" ]; then
+                size_gb=$(echo "scale=2; $filesize/1073741824" | bc)
+                echo "❌ حجم ${size_gb}GB > 1GB - رد شد"
+                index=$((index+1)); continue
               fi
-              echo "📦 حجم فایل: $(echo "scale=2; $filesize/1048576" | bc) مگابایت"
-              aria2c -x 16 -s 16 --console-log-level=error "$url" -o "temp_$index"
-              filename="temp_$index"
+              [ -n "$filesize" ] && echo "  حجم: $(echo "scale=2; $filesize/1048576" | bc)MB"
+              
+              # دانلود با aria2c
+              echo "  دانلود با aria2c..."
+              aria2c -x 16 -s 16 --console-log-level=error \
+                --summary-interval=0 "$url" -o "temp_${index}" 2>&1
+              filename="temp_${index}"
             fi
             
-            # بررسی وجود فایل دانلود شده
+            # بررسی موفقیت دانلود
             if [ ! -f "$filename" ]; then
-              echo "❌ خطا: فایل دانلود نشد"
-              index=$((index+1))
-              continue
+              echo "❌ دانلود ناموفق"
+              index=$((index+1)); continue
             fi
             
-            # مرحله 2: فشرده‌سازی به ZIP با رمز (اختیاری)
+            actual_size=$(stat -c%s "$filename" 2>/dev/null || echo 0)
+            echo "✅ دانلود شد: $(echo "scale=2; $actual_size/1048576" | bc)MB"
+            
+            # ZIP
             timestamp=$(date +%Y%m%d_%H%M%S)
-            zip_name="SalviaFeri_${timestamp}_${index}"
+            zip_base="SF_${timestamp}_${index}"
             
             if [ -n "$password" ]; then
-              echo "🔒 ایجاد ZIP رمزگذاری شده با رمز: $password"
-              zip --password "$password" "${zip_name}.zip" "$filename" > /dev/null
+              zip --password "$password" "${zip_base}.zip" "$filename" > /dev/null 2>&1
             else
-              echo "📦 ایجاد ZIP بدون رمز"
-              zip "${zip_name}.zip" "$filename" > /dev/null
+              zip "${zip_base}.zip" "$filename" > /dev/null 2>&1
             fi
             
-            # مرحله 3: تقسیم فایل بزرگ به پارت‌های 90 مگابایتی
-            filesize_zip=$(stat -c%s "${zip_name}.zip" 2>/dev/null || echo 0)
-            if [ "$filesize_zip" -gt 104857600 ]; then
-              echo "📂 فایل بزرگتر از 100 مگابایت است، در حال تقسیم به پارت‌های 90 مگابایتی..."
-              7z a -v90m "${zip_name}_part.zip" "${zip_name}.zip" > /dev/null
-              rm -f "${zip_name}.zip"
-              for part in "${zip_name}_part.zip".*; do
-                if [ -f "$part" ]; then
-                  mv "$part" "Downloads/"
-                  echo "   ✅ منتقل شد: $part"
-                fi
+            zip_size=$(stat -c%s "${zip_base}.zip" 2>/dev/null || echo 0)
+            
+            # تقسیم اگر > 100MB
+            if [ "$zip_size" -gt "$split_threshold" ]; then
+              echo "🔪 تقسیم به پارت‌های ${split_size_mb}MB..."
+              mkdir -p "split_${index}"
+              (cd "split_${index}" && 7z a -v${split_size_mb}m "../${zip_base}_part.zip" "../${zip_base}.zip" > /dev/null 2>&1)
+              rm -f "${zip_base}.zip"
+              for part in "${zip_base}_part.zip" "${zip_base}_part.zip".*; do
+                [ -f "$part" ] && mv "$part" "Downloads/"
               done
             else
-              mv "${zip_name}.zip" "Downloads/"
-              echo "   ✅ منتقل شد: ${zip_name}.zip"
+              mv "${zip_base}.zip" "Downloads/"
             fi
             
-            # پاکسازی فایل موقت
+            # پاکسازی
             rm -f "$filename"
-            echo "✅ لینک شماره $index با موفقیت پردازش شد"
+            rm -rf "split_${index}"
+            
             total_success=$((total_success+1))
             index=$((index+1))
           done
           
           echo ""
-          echo "═══════════════════════════════════════════════════════════"
-          echo "✅ تعداد لینک‌های موفق: $total_success"
-          echo "═══════════════════════════════════════════════════════════"
+          echo "════════════════════════════════════════════"
+          echo "✅ موفق: ${total_success} از $((index-1))"
+          echo "════════════════════════════════════════════"
 
-      - name: ساخت صفحه index.html
+      - name: ساخت index.html
         run: |
-          cd Downloads
-          cat > index.html << 'HTML'
+          cat > Downloads/index.html << 'HEADER'
           <!DOCTYPE html>
           <html lang="fa" dir="rtl">
-          <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>SalviaFeri - فایل‌های دانلود شده</title>
-            <style>
-              body { font-family: Tahoma, sans-serif; max-width: 800px; margin: auto; padding: 20px; background: #f0f2f5; direction: rtl; }
-              .container { background: white; border-radius: 15px; padding: 25px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-              h1 { color: #1a73e8; text-align: center; }
-              ul { list-style: none; padding: 0; }
-              li { background: #f8f9fa; margin: 10px 0; padding: 12px; border-radius: 8px; border-right: 4px solid #1a73e8; }
-              a { text-decoration: none; color: #1a73e8; font-weight: bold; }
-              a:hover { text-decoration: underline; }
-              .footer { text-align: center; margin-top: 30px; color: #666; font-size: 12px; }
-            </style>
-          </head>
-          <body>
-          <div class="container">
-            <h1>📁 فایل‌های دانلود شده توسط SalviaFeri</h1>
-            <ul>
-          HTML
+          <head><meta charset="UTF-8"><title>SalviaFeri - فایل‌های دانلود شده</title>
+          <style>
+            body { font-family: Tahoma; background: #1a1a2e; color: #eee; max-width: 700px; margin: 40px auto; padding: 20px; }
+            h1 { color: #e94560; text-align: center; }
+            .file { background: #16213e; margin: 10px 0; padding: 15px; border-radius: 8px; border-right: 4px solid #e94560; }
+            .file a { color: #0f3460; background: #e94560; padding: 8px 16px; border-radius: 4px; text-decoration: none; font-weight: bold; }
+            .file a:hover { background: #ff6b6b; }
+            .info { color: #aaa; font-size: 12px; margin-top: 5px; }
+          </style></head><body>
+          <h1>📁 فایل‌های SalviaFeri</h1>
+          HEADER
           
-          for f in *.zip*; do
-            if [ -f "$f" ]; then
-              echo "<li><a href='$f' download>$f</a></li>" >> index.html
-            fi
+          for f in Downloads/*; do
+            [ -f "$f" ] || continue
+            fn=$(basename "$f")
+            sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            sz_mb=$(echo "scale=1; $sz/1048576" | bc)
+            enc=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$fn'))")
+            raw="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/Downloads/${enc}"
+            cat >> Downloads/index.html << ITEM
+          <div class="file"><strong>${fn}</strong><br>
+          <span class="info">${sz_mb} MB</span><br>
+          <a href="${raw}">⬇️ دانلود</a></div>
+          ITEM
           done
           
-          cat >> index.html << 'HTML'
-            </ul>
-            <div class="footer">
-              <p>🚀 SalviaFeri | دانلودر قدرتمند و خودکار</p>
-              <p><a href="https://github.com/SaliSalvia/SalviaFeri">مشاهده پروژه در گیت‌هاب</a></p>
-            </div>
-          </div>
-          </body>
-          </html>
-          HTML
-          cd ..
-          echo "✅ صفحه index.html ساخته شد"
+          cat >> Downloads/index.html << 'FOOTER'
+          <p style="text-align:center;color:#aaa;margin-top:30px;">⚡ SalviaFeri | <a href="https://github.com/SaliSalvia/SalviaFeri" style="color:#e94560;">گیت‌هاب</a></p>
+          </body></html>
+          FOOTER
+          
+          echo "✅ index.html ساخته شد"
 
-      - name: مدیریت خودکار فضا (حذف قدیمی‌ترین فایل در صورت نیاز)
+      - name: مدیریت فضای پوشه Downloads
         run: |
+          max_size=$((900 * 1024 * 1024))
           total_size=$(du -sb Downloads | cut -f1)
-          max_size=943718400  # 900 مگابایت
-          if [ "$total_size" -gt "$max_size" ]; then
-            echo "⚠️ حجم کل پوشه Downloads از 900 مگابایت بیشتر است"
-            oldest_file=$(ls -t Downloads/*.zip* 2>/dev/null | tail -1)
-            if [ -n "$oldest_file" ] && [ -f "$oldest_file" ]; then
-              rm -f "$oldest_file"
-              echo "🗑️ حذف خودکار انجام شد: $(basename "$oldest_file")"
-            fi
+          echo "📊 حجم کل: $(echo "scale=1; $total_size/1048576" | bc)MB / 900MB"
+          
+          while [ "$total_size" -gt "$max_size" ]; do
+            oldest=$(ls -t Downloads/*.zip* Downloads/*.part* 2>/dev/null | tail -1)
+            [ -z "$oldest" ] && break
+            oldest_size=$(stat -c%s "$oldest" 2>/dev/null || echo 0)
+            rm -f "$oldest"
+            echo "🗑️ حذف: $(basename "$oldest")"
+            total_size=$((total_size - oldest_size))
+          done
+          
+          echo "✅ حجم نهایی: $(echo "scale=1; $total_size/1048576" | bc)MB"
+
+      - name: ارسال به گیت‌هاب
+        run: |
+          git add -A Downloads/
+          if git diff --cached --quiet; then
+            echo "ℹ️ تغییر جدیدی وجود ندارد"
           else
-            echo "✅ حجم کل پوشه Downloads: $(echo "scale=2; $total_size/1048576" | bc) مگابایت / 900 مگابایت"
+            git commit -m "✨ SalviaFeri: $(date '+%Y-%m-%d %H:%M')"
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if timeout 300 git push origin "${GITHUB_REF_NAME}"; then
+                echo "✅ Push موفق"; break
+              else
+                echo "🔄 تلاش $i/10..."; sleep 5
+                git fetch origin "${GITHUB_REF_NAME}"
+                git reset --hard origin/"${GITHUB_REF_NAME}"
+              fi
+            done
           fi
 
-      - name: ارسال فایل‌ها به گیت‌هاب
+      - name: توقف WARP
+        if: always()
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Downloads/
-          git commit -m "✨ افزودن فایل‌های دانلود شده - $(date '+%Y-%m-%d %H:%M:%S')" || echo "ℹ️ تغییر جدیدی وجود ندارد"
-          git push
-          echo "✅ تغییرات با موفقیت به گیت‌هاب ارسال شد"
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
