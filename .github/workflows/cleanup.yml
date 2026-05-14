@@ -1,0 +1,22 @@
+name: Cleanup Downloads - SalviaFeri
+
+on:
+  workflow_dispatch:
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: حذف همه فایل‌های Downloads
+        run: |
+          rm -rf Downloads
+          mkdir -p Downloads
+          echo "<html><body><h1>پوشه Downloads خالی است</h1></body></html>" > Downloads/index.html
+      - name: ارسال تغییرات
+        run: |
+          git config user.name "cleanup-bot"
+          git config user.email "cleanup@local"
+          git add Downloads/
+          git commit -m "🧹 پاکسازی کامل پوشه Downloads" || echo "هیچ تغییری"
+          git push
